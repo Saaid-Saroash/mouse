@@ -757,7 +757,7 @@ class MainActivity : Activity() {
                 setHintTextColor(textMuted)
                 inputType = type
                 textSize = 15f
-                singleLine = true
+                setSingleLine(true)
                 background = rounded(surface2, 12f, border)
                 setPadding(dp(12), dp(10), dp(12), dp(10))
             }
