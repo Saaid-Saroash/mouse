@@ -3,6 +3,7 @@
 # Single-file remote mouse + keyboard server using aiohttp + pynput
 
 import sys
+import asyncio
 import os
 import json
 import socket
@@ -17,7 +18,12 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 HOST = "0.0.0.0"
-PORT = 8080
+# HTTP port is selected automatically: first free port from 8080-8090,
+# then an OS-assigned ephemeral port as a fallback.
+PORT_START = 8080
+PORT_END = 8090
+DISCOVERY_PORT = 39567
+DISCOVERY_MESSAGE = b"REMOTE_MOUSE_DISCOVER"
 
 MIN_SENS = 0.8
 MAX_SENS = 3.0
@@ -38,8 +44,8 @@ HTML = r"""<!doctype html>
 <title>Remote Mouse</title>
 <style>
 :root{
-  --bg1:#07111a;
-  --bg2:#0b1324;
+  --bg1:#000000;
+  --bg2:#000000;
   --line:rgba(255,255,255,0.07);
   --line2:rgba(255,255,255,0.1);
   --text:#e8eef7;
@@ -59,7 +65,7 @@ html,body{
   width:100%;
   height:100%;
   overflow:hidden;
-  background:linear-gradient(180deg,var(--bg2) 0%, var(--bg1) 100%);
+  background:#000000;
   font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
   color:var(--text);
 }
@@ -83,7 +89,7 @@ body{
   display:grid;
   grid-template-rows:auto 1fr auto;
   gap:8px;
-  background:linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0.012));
+  background:#030607;
   border:1px solid var(--line);
   border-radius:var(--radius);
   box-shadow:var(--shadow);
@@ -745,19 +751,84 @@ async def handle_client_message(msg):
         except Exception:
             pass
 
-async def on_startup(app):
-    ip = await get_local_ip()
-    print("=== Remote Mouse Server ===")
-    print(f"Open this on your phone: http://{ip}:{PORT}")
-    print(f"Sensitivity: {SENSITIVITY}")
-    print("===========================")
+class DiscoveryProtocol(asyncio.DatagramProtocol):
+    """Answers phone-app broadcasts with the server's selected TCP port."""
+    def __init__(self, http_port):
+        self.http_port = http_port
+        self.transport = None
 
-def main():
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        if data.strip() != DISCOVERY_MESSAGE or self.transport is None:
+            return
+        payload = json.dumps({"service": "remote-mouse", "port": self.http_port}).encode("utf-8")
+        self.transport.sendto(payload, addr)
+
+
+async def get_bound_http_port(site):
+    server = getattr(site, "_server", None)
+    if server is None or not server.sockets:
+        raise RuntimeError("Could not read the HTTP server's bound port")
+    return int(server.sockets[0].getsockname()[1])
+
+
+async def run_server():
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/ws", websocket_handler)
-    app.on_startup.append(on_startup)
-    web.run_app(app, host=HOST, port=PORT)
+
+    runner = web.AppRunner(app)
+    discovery_transport = None
+    await runner.setup()
+    site = None
+    chosen_port = None
+    try:
+        # Prefer the familiar 8080 port when free, but choose another one
+        # automatically when it is already occupied.
+        for candidate in range(PORT_START, PORT_END + 1):
+            candidate_site = web.TCPSite(runner, HOST, candidate)
+            try:
+                await candidate_site.start()
+                site = candidate_site
+                chosen_port = candidate
+                break
+            except OSError:
+                continue
+
+        if site is None:
+            site = web.TCPSite(runner, HOST, 0)
+            await site.start()
+            chosen_port = await get_bound_http_port(site)
+
+        loop = asyncio.get_running_loop()
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        udp_socket.bind((HOST, DISCOVERY_PORT))
+        discovery_transport, _ = await loop.create_datagram_endpoint(
+            lambda: DiscoveryProtocol(chosen_port), sock=udp_socket
+        )
+
+        ip = await get_local_ip()
+        print("=== Remote Mouse Server ===")
+        print(f"Server: http://{ip}:{chosen_port}")
+        print(f"WebSocket: ws://{ip}:{chosen_port}/ws")
+        print(f"Auto-discovery: UDP {DISCOVERY_PORT}")
+        print("Open Remote Mouse on your phone and select Wi-Fi; IP and port are discovered automatically.")
+        print("Keep this window running. Allow Python on Private networks if Windows Firewall asks.")
+        print(f"Sensitivity: {SENSITIVITY}")
+        print("===========================")
+        await asyncio.Event().wait()
+    finally:
+        if discovery_transport is not None:
+            discovery_transport.close()
+        await runner.cleanup()
+
+
+def main():
+    asyncio.run(run_server())
 
 if __name__ == "__main__":
     try:
