@@ -62,10 +62,19 @@ class MainActivity : Activity() {
     private lateinit var wifiModeButton: Button
     private lateinit var bluetoothModeButton: Button
     private lateinit var keyboardButton: Button
+    private lateinit var menuButton: Button
     private lateinit var keyboardInput: EditText
     @Volatile private var wifiDiscoveryRunning = false
     private var serverAuthority: String? = null
+    private var manualAuthority: String? = null
+    private var bluetoothDiscoverabilityRequested = false
+    private var selectingBluetoothHost = false
     private val discoveryPort = 39567
+    private val connectionPrefs by lazy { getSharedPreferences("remote_mouse_connections", MODE_PRIVATE) }
+
+    private data class SavedWifiLaptop(val label: String, val host: String, val port: Int) {
+        fun authority(): String = if (host.contains(":")) "[$host]:$port" else "$host:$port"
+    }
 
     private var mode = Mode.WIFI
     private var sensitivity = 1.1f
@@ -76,7 +85,11 @@ class MainActivity : Activity() {
     private var wifiAutoReconnect = false
     private val wifiHandler = Handler(Looper.getMainLooper())
     private val wifiReconnectTask = Runnable {
-        if (mode == Mode.WIFI && wifiAutoReconnect && !socketOpen) discoverWifiServer(showFailureToast = false)
+        if (mode == Mode.WIFI && wifiAutoReconnect && !socketOpen) {
+            val pinned = manualAuthority
+            if (pinned != null) openWifiSocket(pinned, showFailureToast = false)
+            else discoverWifiServer(showFailureToast = false)
+        }
     }
     private val httpClient = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
@@ -86,12 +99,16 @@ class MainActivity : Activity() {
 
     private var bluetoothController: BluetoothHidController? = null
     private val bluetooth: BluetoothHidController
-        get() = bluetoothController ?: BluetoothHidController(this) { message, connected ->
-            runOnUiThread {
-                bluetoothOpen = connected
-                if (mode == Mode.BLUETOOTH) setStatus(message, connected)
-            }
-        }.also { bluetoothController = it }
+        get() = bluetoothController ?: BluetoothHidController(
+            this,
+            { message, connected ->
+                runOnUiThread {
+                    bluetoothOpen = connected
+                    if (mode == Mode.BLUETOOTH) setStatus(message, connected)
+                }
+            },
+            { runOnUiThread { onBluetoothHidReady() } }
+        ).also { bluetoothController = it }
 
     enum class Mode { WIFI, BLUETOOTH }
 
@@ -152,7 +169,7 @@ class MainActivity : Activity() {
             textSize = if (compact) 10f else 11f
             contentDescription = "Bluetooth HID mode. Long press to select a paired laptop."
             setOnClickListener { switchMode(Mode.BLUETOOTH) }
-            setOnLongClickListener { choosePairedLaptop(); true }
+            setOnLongClickListener { showPairedBluetoothMenu(); true }
         }
         leftCluster.addView(wifiModeButton, LinearLayout.LayoutParams(if (compact) dp(42) else dp(46), topControlHeight).apply { rightMargin = dp(3) })
         leftCluster.addView(bluetoothModeButton, LinearLayout.LayoutParams(if (compact) dp(34) else dp(38), topControlHeight).apply { rightMargin = dp(6) })
@@ -185,7 +202,13 @@ class MainActivity : Activity() {
             contentDescription = "Increase sensitivity"
             setOnClickListener { changeSensitivity(0.1f) }
         }, LinearLayout.LayoutParams(sensButtonWidth, if (compact) dp(34) else dp(36)))
-        topbar.addView(sensBox, LinearLayout.LayoutParams(-2, -2))
+        topbar.addView(sensBox, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(4) })
+        menuButton = actionButton("⋮", false).apply {
+            textSize = 20f
+            contentDescription = "Connection menu: edit laptop address, saved laptops, and Bluetooth devices"
+            setOnClickListener { showConnectionMenu() }
+        }
+        topbar.addView(menuButton, LinearLayout.LayoutParams(if (compact) dp(30) else dp(34), topControlHeight))
         shell.addView(topbar, LinearLayout.LayoutParams(-1, if (compact) dp(42) else dp(44)).apply { bottomMargin = dp(8) })
 
         val mainRow = LinearLayout(this).apply {
@@ -338,20 +361,24 @@ class MainActivity : Activity() {
             wifiAutoReconnect = true
             if (!hasWifiDiscoveryPermission()) return
             if (socketOpen) setStatus("CONNECTED · WI-FI", true)
-            else discoverWifiServer(showFailureToast = true)
+            else {
+                val pinned = manualAuthority
+                if (pinned != null) openWifiSocket(pinned, showFailureToast = true)
+                else discoverWifiServer(showFailureToast = true)
+            }
         } else {
             wifiAutoReconnect = false
             wifiHandler.removeCallbacks(wifiReconnectTask)
             socket?.close(1000, "Switched to Bluetooth")
             socket = null
             socketOpen = false
+            bluetoothDiscoverabilityRequested = false
             setStatus("STARTING BLUETOOTH HID…", false)
             if (!hasBluetoothPermissions()) {
                 requestBluetoothPermissions()
                 setStatus("BLUETOOTH PERMISSION REQUIRED", false)
             } else {
                 startBluetoothHid()
-                makeDiscoverable()
             }
         }
     }
@@ -454,7 +481,13 @@ class MainActivity : Activity() {
                 wifiDiscoveryRunning = false
                 if (mode != Mode.WIFI || !wifiAutoReconnect) return@runOnUiThread
                 if (foundAuthority != null) {
+                    manualAuthority = null
                     serverAuthority = foundAuthority
+                    val discoveredHost = foundAuthority!!.substringBeforeLast(':')
+                    val discoveredPort = foundAuthority!!.substringAfterLast(':').toIntOrNull()
+                    if (discoveredPort != null) {
+                        saveWifiLaptop(SavedWifiLaptop("Discovered laptop", discoveredHost, discoveredPort))
+                    }
                     openWifiSocket(foundAuthority!!, showFailureToast)
                 } else {
                     setStatus("LAPTOP SERVER NOT FOUND", false)
@@ -527,7 +560,53 @@ class MainActivity : Activity() {
             requestBluetoothPermissions()
             return
         }
+        val adapter = BluetoothAdapter.getDefaultAdapter()
+        if (adapter == null) {
+            setStatus("BLUETOOTH NOT SUPPORTED", false)
+            return
+        }
+        if (!adapter.isEnabled) {
+            @Suppress("DEPRECATION")
+            startActivityForResult(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), 702)
+            setStatus("TURN BLUETOOTH ON TO CONTINUE", false)
+            return
+        }
         bluetooth.start()
+        // start() can return immediately when this controller is already registered.
+        if (bluetooth.isRegistered()) onBluetoothHidReady()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Android may unregister a HID app when it leaves the foreground.
+        // Re-register when the user returns to this Activity.
+        if (mode == Mode.BLUETOOTH && hasBluetoothPermissions()) {
+            bluetooth.start()
+            if (bluetooth.isRegistered()) onBluetoothHidReady()
+        }
+    }
+
+    /** Called only after Android confirms registerApp() via onAppStatusChanged. */
+    private fun onBluetoothHidReady() {
+        if (mode != Mode.BLUETOOTH || isFinishing || selectingBluetoothHost) return
+        val preferred = connectionPrefs.getString("preferred_bluetooth_address", null)
+        if (!preferred.isNullOrBlank()) {
+            try {
+                val device = BluetoothAdapter.getDefaultAdapter()?.bondedDevices
+                    ?.firstOrNull { it.address.equals(preferred, ignoreCase = true) }
+                if (device != null) {
+                    bluetooth.connect(device)
+                    return
+                }
+            } catch (_: SecurityException) {
+                setStatus("BLUETOOTH CONNECT PERMISSION REQUIRED", false)
+                return
+            }
+        }
+        if (!bluetoothDiscoverabilityRequested) {
+            bluetoothDiscoverabilityRequested = true
+            makeDiscoverable()
+        }
     }
 
     private fun makeDiscoverable() {
@@ -537,7 +616,7 @@ class MainActivity : Activity() {
         }
         val adapter = BluetoothAdapter.getDefaultAdapter()
         if (adapter == null) {
-            toast("This device does not have Bluetooth")
+            setStatus("BLUETOOTH NOT SUPPORTED", false)
             return
         }
         if (!adapter.isEnabled) {
@@ -552,6 +631,7 @@ class MainActivity : Activity() {
             @Suppress("DEPRECATION")
             startActivityForResult(intent, 703)
         } catch (e: SecurityException) {
+            setStatus("BLUETOOTH ADVERTISE PERMISSION REQUIRED", false)
             toast("Allow Nearby devices permission, then try again")
         }
     }
@@ -564,8 +644,8 @@ class MainActivity : Activity() {
         try {
             val devices = bluetooth.pairedDevices()
             if (devices.isEmpty()) {
-                toast("No paired laptop yet. Pair from the laptop's Bluetooth settings first.")
-                makeDiscoverable()
+                toast("No paired laptop yet. Use Windows Settings → Bluetooth & devices → Add device first.")
+                onBluetoothHidReady()
                 return
             }
             val names = devices.map { device ->
@@ -573,11 +653,15 @@ class MainActivity : Activity() {
                 "$name\n${device.address}"
             }.toTypedArray()
             android.app.AlertDialog.Builder(this)
-                .setTitle("Choose your laptop")
-                .setItems(names) { _, which -> bluetooth.connect(devices[which]) }
+                .setTitle("Choose paired laptop")
+                .setItems(names) { _, which ->
+                    val device = devices[which]
+                    connectionPrefs.edit().putString("preferred_bluetooth_address", device.address).apply()
+                    bluetooth.connect(device) // queues until HID registration completes
+                }
                 .setNegativeButton("Cancel", null)
                 .show()
-        } catch (e: SecurityException) {
+        } catch (_: SecurityException) {
             toast("Bluetooth permission was not granted")
         }
     }
@@ -603,7 +687,6 @@ class MainActivity : Activity() {
         if (requestCode == 701) {
             if (hasBluetoothPermissions()) {
                 startBluetoothHid()
-                if (mode == Mode.BLUETOOTH) makeDiscoverable()
             } else toast("Bluetooth permissions are needed for HID pairing")
         } else if (requestCode == 704) {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -622,11 +705,274 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == 702 && resultCode == Activity.RESULT_OK) {
             startBluetoothHid()
-            makeDiscoverable()
         }
         if (requestCode == 703 && resultCode != Activity.RESULT_CANCELED) {
             toast("Phone is discoverable. Add 'Remote Mouse' from the laptop's Bluetooth settings.")
         }
+    }
+
+    private fun showConnectionMenu() {
+        val entries = arrayOf(
+            "Connect using laptop IP / port",
+            "Saved Wi-Fi laptops",
+            "Discover laptop automatically",
+            "Paired Bluetooth laptops",
+            "Bluetooth pairing instructions"
+        )
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Connections")
+            .setItems(entries) { _, which ->
+                when (which) {
+                    0 -> showWifiEndpointDialog()
+                    1 -> showSavedWifiLaptops()
+                    2 -> {
+                        mode = Mode.WIFI
+                        styleModeButton(wifiModeButton, true)
+                        styleModeButton(bluetoothModeButton, false)
+                        manualAuthority = null
+                        wifiAutoReconnect = true
+                        socket?.close(1000, "Starting laptop discovery")
+                        socket = null
+                        socketOpen = false
+                        if (hasWifiDiscoveryPermission()) discoverWifiServer(showFailureToast = true)
+                    }
+                    3 -> showPairedBluetoothMenu()
+                    4 -> showBluetoothInstructions()
+                }
+            }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun showWifiEndpointDialog(prefill: SavedWifiLaptop? = null) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), dp(4))
+        }
+        fun addField(hint: String, value: String, type: Int): EditText {
+            val field = EditText(this).apply {
+                this.hint = hint
+                setText(value)
+                setTextColor(textMain)
+                setHintTextColor(textMuted)
+                inputType = type
+                textSize = 15f
+                singleLine = true
+                background = rounded(surface2, 12f, border)
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+            }
+            box.addView(field, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(9) })
+            return field
+        }
+        val nameField = addField("Laptop name (e.g. My PC)", prefill?.label ?: "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
+        val hostField = addField("Laptop IP or hostname", prefill?.host ?: "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        val portField = addField("Port (shown by mouse.py; usually 8080)", (prefill?.port ?: 8080).toString(), InputType.TYPE_CLASS_NUMBER)
+        val saveCheck = android.widget.CheckBox(this).apply {
+            text = "Save laptop for one-tap reconnection"
+            setTextColor(textMain)
+            isChecked = true
+            buttonTintList = android.content.res.ColorStateList.valueOf(accent)
+        }
+        box.addView(saveCheck)
+
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("Connect to laptop")
+            .setView(box)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Connect", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val rawHost = hostField.text.toString().trim()
+                    .removePrefix("http://").removePrefix("https://").trimEnd('/')
+                val host = rawHost.substringBefore('/')
+                val port = portField.text.toString().trim().toIntOrNull()
+                val validHost = host.isNotBlank() && host.length <= 253 &&
+                    (host.matches(Regex("[A-Za-z0-9._-]+")) || host.matches(Regex("[0-9A-Fa-f:]+")))
+                if (!validHost || port == null || port !in 1..65535) {
+                    toast("Enter a valid laptop IP/hostname and port (1–65535).")
+                    return@setOnClickListener
+                }
+                val label = nameField.text.toString().trim().ifBlank { host }
+                if (saveCheck.isChecked) saveWifiLaptop(SavedWifiLaptop(label, host, port), prefill)
+                else if (prefill != null) removeSavedWifiLaptop(prefill)
+                connectWifiEndpoint(host, port)
+                dialog.dismiss()
+            }
+        }
+        dialog.show()
+        hostField.requestFocus()
+    }
+
+    private fun connectWifiEndpoint(host: String, port: Int) {
+        val authority = if (host.contains(":")) "[$host]:$port" else "$host:$port"
+        mode = Mode.WIFI
+        styleModeButton(wifiModeButton, true)
+        styleModeButton(bluetoothModeButton, false)
+        wifiAutoReconnect = true
+        manualAuthority = authority
+        serverAuthority = authority
+        wifiHandler.removeCallbacks(wifiReconnectTask)
+        socket?.close(1000, "Switching to selected laptop")
+        socket = null
+        socketOpen = false
+        openWifiSocket(authority, showFailureToast = true)
+    }
+
+    private fun loadSavedWifiLaptops(): MutableList<SavedWifiLaptop> {
+        val result = mutableListOf<SavedWifiLaptop>()
+        val raw = connectionPrefs.getString("saved_wifi_laptops", null) ?: return result
+        try {
+            val array = org.json.JSONArray(raw)
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val host = item.optString("host").trim()
+                val port = item.optInt("port", -1)
+                if (host.isNotBlank() && port in 1..65535) {
+                    result.add(SavedWifiLaptop(item.optString("label", host), host, port))
+                }
+            }
+        } catch (_: Exception) { }
+        return result
+    }
+
+    private fun saveWifiLaptop(laptop: SavedWifiLaptop, replacing: SavedWifiLaptop? = null) {
+        val items = loadSavedWifiLaptops()
+        if (replacing != null) items.removeAll { it.host.equals(replacing.host, true) && it.port == replacing.port }
+        items.removeAll { it.host.equals(laptop.host, true) && it.port == laptop.port }
+        items.add(0, laptop)
+        while (items.size > 12) items.removeAt(items.lastIndex)
+        val array = org.json.JSONArray()
+        items.forEach { item ->
+            array.put(JSONObject().put("label", item.label).put("host", item.host).put("port", item.port))
+        }
+        connectionPrefs.edit().putString("saved_wifi_laptops", array.toString()).apply()
+    }
+
+    private fun removeSavedWifiLaptop(laptop: SavedWifiLaptop) {
+        val remaining = loadSavedWifiLaptops().apply { removeAll { it.host == laptop.host && it.port == laptop.port } }
+        val array = org.json.JSONArray()
+        remaining.forEach { saved -> array.put(JSONObject().put("label", saved.label).put("host", saved.host).put("port", saved.port)) }
+        connectionPrefs.edit().putString("saved_wifi_laptops", array.toString()).apply()
+    }
+
+    private fun showSavedWifiLaptops() {
+        val items = loadSavedWifiLaptops()
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+        }
+        val scroll = android.widget.ScrollView(this).apply { addView(content) }
+        lateinit var savedDialog: android.app.AlertDialog
+        if (items.isEmpty()) {
+            content.addView(label("No saved laptops yet. Add an IP and port to reconnect without discovery.", 14f, textMuted, false))
+        } else {
+            items.forEach { item ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(6), 0, dp(6))
+                }
+                val names = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                names.addView(label(item.label, 14f, textMain, true))
+                names.addView(label("${item.host}:${item.port}", 12f, textMuted, false))
+                row.addView(names, LinearLayout.LayoutParams(0, -2, 1f))
+                row.addView(actionButton("Connect", true).apply {
+                    textSize = 11f
+                    setOnClickListener {
+                        savedDialog.dismiss()
+                        connectWifiEndpoint(item.host, item.port)
+                    }
+                }, LinearLayout.LayoutParams(dp(76), dp(38)).apply { rightMargin = dp(6) })
+                row.addView(actionButton("Edit", false).apply {
+                    textSize = 10f
+                    setOnClickListener {
+                        savedDialog.dismiss()
+                        showWifiEndpointDialog(item)
+                    }
+                }, LinearLayout.LayoutParams(dp(42), dp(38)).apply { rightMargin = dp(5) })
+                row.addView(actionButton("×", false).apply {
+                    setOnClickListener {
+                        savedDialog.dismiss()
+                        removeSavedWifiLaptop(item)
+                        showSavedWifiLaptops()
+                    }
+                }, LinearLayout.LayoutParams(dp(34), dp(38)))
+                content.addView(row)
+                val divider = View(this).apply { setBackgroundColor(border) }
+                content.addView(divider, LinearLayout.LayoutParams(-1, dp(1)))
+            }
+        }
+        savedDialog = android.app.AlertDialog.Builder(this)
+            .setTitle("Saved Wi-Fi laptops")
+            .setView(scroll)
+            .setPositiveButton("Add laptop", null)
+            .setNegativeButton("Close", null)
+            .create()
+        savedDialog.setOnShowListener { savedDialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            savedDialog.dismiss()
+            showWifiEndpointDialog()
+        } }
+        savedDialog.show()
+    }
+
+    private fun showBluetoothInstructions() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Bluetooth HID setup")
+            .setMessage(
+                "1. Keep Remote Mouse open in the foreground.\n\n" +
+                "2. Tap BT and allow Nearby devices permissions. Wait for HID READY.\n\n" +
+                "3. In Windows: Settings → Bluetooth & devices → Add device → Bluetooth. Select Remote Mouse.\n\n" +
+                "4. After Windows pairs, return here and use the menu → Paired Bluetooth laptops to connect.\n\n" +
+                "If this phone reports HID DEVICE PROFILE UNAVAILABLE, its Bluetooth firmware does not expose Android's HID Device role; the app cannot enable that role by itself."
+            )
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    private fun showPairedBluetoothMenu() {
+        if (!hasBluetoothPermissions()) {
+            requestBluetoothPermissions()
+            return
+        }
+        mode = Mode.BLUETOOTH
+        styleModeButton(wifiModeButton, false)
+        styleModeButton(bluetoothModeButton, true)
+        wifiAutoReconnect = false
+        wifiHandler.removeCallbacks(wifiReconnectTask)
+        socket?.close(1000, "Switched to Bluetooth")
+        socket = null
+        socketOpen = false
+        selectingBluetoothHost = true
+        startBluetoothHid()
+        val devices = bluetooth.pairedDevices()
+        if (devices.isEmpty()) {
+            selectingBluetoothHost = false
+            onBluetoothHidReady()
+            toast("No paired laptop yet. Keep this app open. After HID is ready, pair Remote Mouse from Windows Bluetooth settings, then return here.")
+            return
+        }
+        val labels = devices.map { device ->
+            val name = try { device.name?.takeIf { it.isNotBlank() } ?: "Bluetooth device" } catch (_: SecurityException) { "Bluetooth device" }
+            "$name\n${device.address}"
+        }.toTypedArray()
+        val deviceDialog = android.app.AlertDialog.Builder(this)
+            .setTitle("Paired Bluetooth laptops")
+            .setItems(labels) { _, which ->
+                selectingBluetoothHost = false
+                val device = devices[which]
+                connectionPrefs.edit().putString("preferred_bluetooth_address", device.address).apply()
+                mode = Mode.BLUETOOTH
+                styleModeButton(wifiModeButton, false)
+                styleModeButton(bluetoothModeButton, true)
+                wifiAutoReconnect = false
+                wifiHandler.removeCallbacks(wifiReconnectTask)
+                bluetooth.connect(device)
+            }
+            .setNegativeButton("Cancel", null)
+            .create()
+        deviceDialog.setOnCancelListener { selectingBluetoothHost = false }
+        deviceDialog.show()
     }
 
     private fun hasActiveConnection(): Boolean = if (mode == Mode.WIFI) socketOpen else bluetoothOpen

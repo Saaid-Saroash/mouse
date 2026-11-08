@@ -71,3 +71,23 @@ Bluetooth HID requires Android 9 (API 28) or newer, and the phone's Bluetooth fi
 - Wi-Fi uses a local WebSocket (`ws://`) and UDP broadcast discovery. Keep `mouse.py` running on the laptop while using Wi-Fi mode.
 - Bluetooth mode is direct HID and does not use the laptop Python server.
 - The laptop server runs with the permissions of the Windows user who launched it. Use it only on a network you trust.
+
+
+## Saved laptop menu
+
+Tap the new ⋮ menu button in the top bar. You can enter a laptop IP/hostname and TCP port, save up to 12 Wi-Fi endpoints, reconnect to a saved entry, remove an entry, or trigger automatic discovery. Saved endpoints are stored locally on the phone. `mouse.py` prints the active HTTP/WebSocket port when it starts; enter that port for manual connections.
+
+## Bluetooth HID connection notes
+
+The app now waits for Android's `onAppStatusChanged(..., isRegistered=true)` callback before requesting discoverability or connecting to a saved paired host. A selected bonded computer is queued until HID registration completes. The app stores the preferred bonded host and reconnects to it on the next HID registration. Keep the app in the foreground: Android documents that HID app registration is automatically removed when the app is no longer foreground. Bluetooth HID Device support is firmware-dependent; if Android reports that the HID Device profile is unavailable, this phone's Bluetooth stack does not expose the required role to third-party apps.
+
+
+## Manual and remembered connections
+
+Use the ⋮ menu in the top bar to enter a laptop hostname/IP and port, save up to 12 Wi-Fi laptop endpoints, reconnect to a saved endpoint, remove saved entries, start auto-discovery, or pick a Bluetooth-bonded laptop. The saved Wi-Fi list and preferred paired Bluetooth host are stored in the app's private preferences on the phone.
+
+## Bluetooth HID pairing sequence
+
+Bluetooth is now registered first. The app requests phone discoverability only after Android confirms that the HID application is registered. Keep Remote Mouse in the foreground. In Windows, use Settings → Bluetooth & devices → Add device → Bluetooth and select Remote Mouse. After pairing, open ⋮ → Paired Bluetooth laptops and choose the PC. The selected bonded host is remembered. If Windows has a stale pairing, remove Remote Mouse from both sides, restart Bluetooth on both devices, then pair again. Android's public `BluetoothHidDevice.connect()` initiates a connection only to a host that is already paired, and it requires the HID app registration to be active.
+
+Android documents that the HID app is automatically unregistered when the application is no longer foreground. Return to this app to re-register. Actual HID Device support is also dependent on the phone's Bluetooth implementation; this app can report when the profile is missing but cannot add it to unsupported firmware.
