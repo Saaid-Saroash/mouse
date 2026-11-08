@@ -32,7 +32,17 @@ class BluetoothHidController(
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, isRegistered: Boolean) {
             registered = isRegistered
             if (isRegistered) {
-                status("READY · PAIR FROM LAPTOP", false)
+                // Android may report the host that was already attached when
+                // the HID app registered. Keep that host as the active target.
+                if (pluggedDevice != null) {
+                    activeDevice = pluggedDevice
+                    connected = true
+                    val name = try { pluggedDevice.name?.takeIf { it.isNotBlank() } ?: "LAPTOP" }
+                        catch (_: SecurityException) { "LAPTOP" }
+                    status("CONNECTED · $name", true)
+                } else {
+                    status("READY · PAIR FROM LAPTOP", false)
+                }
             } else if (!connected) {
                 status("HID REGISTRATION STOPPED", false)
             }
@@ -169,7 +179,8 @@ class BluetoothHidController(
         if (!connected) return
         val mask = if (right) 0x02 else 0x01
         sendMouse(mask, 0, 0, 0)
-        sendMouse(0, 0, 0, 0)
+        // Keep the press and release as distinct HID reports on slower stacks.
+        mainHandler.postDelayed({ if (connected) sendMouse(0, 0, 0, 0) }, 12L)
     }
 
     fun scroll(amount: Float) {
@@ -203,7 +214,7 @@ class BluetoothHidController(
     private fun sendMouse(buttons: Int, dx: Int, dy: Int, wheel: Int) {
         val device = activeDevice ?: return
         try {
-            hid?.sendReport(
+            val accepted = hid?.sendReport(
                 device,
                 REPORT_MOUSE,
                 byteArrayOf(
@@ -212,7 +223,8 @@ class BluetoothHidController(
                     dy.coerceIn(-127, 127).toByte(),
                     wheel.coerceIn(-127, 127).toByte()
                 )
-            )
+            ) == true
+            if (!accepted) status("MOUSE REPORT REJECTED · RECONNECT BLUETOOTH", false)
         } catch (_: SecurityException) {
             status("BLUETOOTH PERMISSION REQUIRED", false)
         }
@@ -224,7 +236,8 @@ class BluetoothHidController(
         report[0] = modifier.toByte()
         report[2] = keyCode.toByte()
         try {
-            hid?.sendReport(device, REPORT_KEYBOARD, report)
+            val accepted = hid?.sendReport(device, REPORT_KEYBOARD, report) == true
+            if (!accepted) status("KEYBOARD REPORT REJECTED · RECONNECT BLUETOOTH", false)
         } catch (_: SecurityException) {
             status("BLUETOOTH PERMISSION REQUIRED", false)
         }
@@ -232,7 +245,7 @@ class BluetoothHidController(
 
     private fun pressKey(modifier: Int, keyCode: Int) {
         sendKeyboard(modifier, keyCode)
-        sendKeyboard(0, 0)
+        mainHandler.postDelayed({ if (connected) sendKeyboard(0, 0) }, 12L)
     }
 
     private fun toHidKey(character: Char): Pair<Int, Int>? {
@@ -268,6 +281,8 @@ class BluetoothHidController(
         hid = null
         connected = false
         registered = false
+        proxyRequested = false
+        activeDevice = null
     }
 
     companion object {

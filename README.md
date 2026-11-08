@@ -4,7 +4,7 @@ An Android mouse/keyboard app that keeps the original `mouse.py` touchpad arrang
 
 ## Connection modes
 
-- **Wi-Fi:** the laptop's `mouse.py` server must already be running. The app automatically discovers the laptop and its selected TCP port on the same local Wi-Fi network. No IP address or port entry is required.
+- **Wi-Fi:** the laptop's `mouse.py` server must already be running. The app automatically discovers the laptop and its selected TCP port on the same local Wi-Fi network. No IP address or port entry is required. On Android 13+, allow the Nearby devices permission when prompted so local-network discovery can work on devices that enforce Wi-Fi discovery protections.
 - **Bluetooth:** the Android phone registers as a native Bluetooth Classic HID mouse + keyboard. The Python server is not needed in this mode.
 
 ## Build the APK with GitHub Actions
@@ -14,7 +14,7 @@ An Android mouse/keyboard app that keeps the original `mouse.py` touchpad arrang
 3. When the workflow succeeds, download the `Remote-Mouse-debug-apk` artifact.
 4. Extract it and install `app-debug.apk` on the Android phone.
 
-The project uses JDK 17, Gradle 8.11.1, Android SDK Platform 35, and a debug signing key for sideloading.
+The project uses JDK 17, Gradle 8.11.1, Android SDK Platform 35, and a debug signing key for sideloading. The app handles Android 15 edge-to-edge system bar insets and scales the original control widths for compact screens and landscape orientation.
 
 ## Laptop server setup (Wi-Fi mode)
 
@@ -33,7 +33,7 @@ The project uses JDK 17, Gradle 8.11.1, Android SDK Platform 35, and a debug sig
    py mouse.py
    ```
 
-4. Open Remote Mouse on the phone and tap **Wi-Fi**. It broadcasts a discovery request and connects to the laptop automatically.
+4. Open Remote Mouse on the phone and tap **Wi-Fi**. It broadcasts to the Wi-Fi subnet and the global broadcast address, then connects to the laptop automatically. Tap the status dot to read the current connection state. Tap Wi-Fi again to retry discovery.
 
 ### How automatic port selection works
 
@@ -53,7 +53,7 @@ If all ports 8080–8090 are occupied and the server falls back to an OS-assigne
 1. Turn Bluetooth on for the phone and laptop.
 2. Tap **BT** in the app and grant the Nearby devices permissions.
 3. The app starts its HID profile and requests discoverability. On Windows, open **Settings → Bluetooth & devices → Add device → Bluetooth** and pair with **Remote Mouse**.
-4. Long-press the **BT** mode button to choose an already-paired laptop manually if Windows does not connect automatically.
+4. After pairing, Windows should connect the HID profile. If it does not, long-press **BT** in the app and select the paired laptop. The status dot turns teal when connected; tap it to view the full status message.
 
 Bluetooth HID requires Android 9 (API 28) or newer, and the phone's Bluetooth firmware must expose the HID Device profile to third-party apps. Some devices do not expose this profile. Bluetooth keyboard reports use a US-layout HID map; unsupported Unicode characters may be skipped.
 
@@ -61,7 +61,7 @@ Bluetooth HID requires Android 9 (API 28) or newer, and the phone's Bluetooth fi
 
 - Drag on the touch surface to move the pointer; tap for left click; two-finger touch for right click.
 - Use the right-side scroll rail or the ▲ / ▼ buttons to scroll.
-- Use the bottom Left / Right buttons for explicit clicks.
+- Use the bottom Left / Right buttons for explicit clicks. When disconnected, click/scroll actions show a status hint rather than silently doing nothing.
 - Adjust pointer sensitivity with − / +.
 - Tap the keyboard icon to open the phone keyboard; text and Enter are forwarded to the laptop.
 

@@ -13,21 +13,25 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.net.wifi.WifiManager
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -38,6 +42,7 @@ import java.util.concurrent.TimeUnit
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -65,7 +70,9 @@ class MainActivity : Activity() {
     private var mode = Mode.WIFI
     private var sensitivity = 1.1f
     private var socket: WebSocket? = null
-    private var socketOpen = false
+    @Volatile private var socketOpen = false
+    @Volatile private var bluetoothOpen = false
+    private var lastConnectionHintAt = 0L
     private var wifiAutoReconnect = false
     private val wifiHandler = Handler(Looper.getMainLooper())
     private val wifiReconnectTask = Runnable {
@@ -81,6 +88,7 @@ class MainActivity : Activity() {
     private val bluetooth: BluetoothHidController
         get() = bluetoothController ?: BluetoothHidController(this) { message, connected ->
             runOnUiThread {
+                bluetoothOpen = connected
                 if (mode == Mode.BLUETOOTH) setStatus(message, connected)
             }
         }.also { bluetoothController = it }
@@ -98,13 +106,24 @@ class MainActivity : Activity() {
     }
 
     private fun buildUi() {
-        // The layout follows mouse.py's original touchpad screen: top controls,
-        // one large pad with a narrow scroll rail, and Left/Right buttons.
+        // Match the original mouse.py layout: top controls, a single flexible
+        // touch surface with a slim scroll rail, and two bottom click buttons.
+        // All dimensions are in dp and the content area is inset-aware so
+        // Android 15 edge-to-edge does not cover the controls with system bars.
+        val screenWidth = resources.configuration.screenWidthDp
+        val compact = screenWidth < 360
+        val basePadding = if (compact) dp(7) else dp(9)
+        val railWidth = if (compact) dp(46) else dp(52)
+        val topControlHeight = if (compact) dp(38) else dp(40)
+        val bottomButtonHeight = if (resources.configuration.screenHeightDp < 620) dp(48) else dp(54)
+
         val shell = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(9), dp(9), dp(9), dp(9))
+            setPadding(basePadding, basePadding, basePadding, basePadding)
             background = rounded(Color.BLACK, 22f, Color.rgb(30, 40, 44))
             clipToPadding = true
+            clipChildren = true
+            fitsSystemWindows = false
         }
 
         val topbar = LinearLayout(this).apply {
@@ -117,58 +136,65 @@ class MainActivity : Activity() {
         }
         statusDot = View(this).apply {
             background = rounded(Color.rgb(238, 91, 91), 100f)
-            layoutParams = LinearLayout.LayoutParams(dp(9), dp(9)).apply { rightMargin = dp(7) }
+            contentDescription = "Connection status"
+            isClickable = true
+            setOnClickListener { toast(statusText.text.toString()) }
+            layoutParams = LinearLayout.LayoutParams(dp(9), dp(9)).apply { rightMargin = dp(6) }
         }
         leftCluster.addView(statusDot)
 
         wifiModeButton = actionButton("Wi-Fi", true).apply {
-            textSize = 11f
-            contentDescription = "Wi-Fi mode — automatically find laptop server"
+            textSize = if (compact) 10f else 11f
+            contentDescription = "Wi-Fi mode — automatically discover the laptop server. Tap again to retry."
             setOnClickListener { switchMode(Mode.WIFI) }
         }
         bluetoothModeButton = actionButton("BT", false).apply {
-            textSize = 11f
-            contentDescription = "Bluetooth HID mode"
+            textSize = if (compact) 10f else 11f
+            contentDescription = "Bluetooth HID mode. Long press to select a paired laptop."
             setOnClickListener { switchMode(Mode.BLUETOOTH) }
             setOnLongClickListener { choosePairedLaptop(); true }
         }
-        leftCluster.addView(wifiModeButton, LinearLayout.LayoutParams(dp(46), dp(40)).apply { rightMargin = dp(3) })
-        leftCluster.addView(bluetoothModeButton, LinearLayout.LayoutParams(dp(38), dp(40)).apply { rightMargin = dp(7) })
+        leftCluster.addView(wifiModeButton, LinearLayout.LayoutParams(if (compact) dp(42) else dp(46), topControlHeight).apply { rightMargin = dp(3) })
+        leftCluster.addView(bluetoothModeButton, LinearLayout.LayoutParams(if (compact) dp(34) else dp(38), topControlHeight).apply { rightMargin = dp(6) })
 
         keyboardButton = actionButton("⌨️", false).apply {
             textSize = 18f
-            contentDescription = "Open keyboard"
+            contentDescription = "Open phone keyboard"
             setOnClickListener { openPhoneKeyboard() }
         }
-        leftCluster.addView(keyboardButton, LinearLayout.LayoutParams(dp(40), dp(40)))
+        leftCluster.addView(keyboardButton, LinearLayout.LayoutParams(if (compact) dp(36) else dp(40), topControlHeight))
         topbar.addView(leftCluster, LinearLayout.LayoutParams(0, -2, 1f))
 
         val sensBox = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = rounded(Color.rgb(5, 8, 9), 15f, Color.rgb(35, 45, 49))
-            setPadding(dp(4), dp(4), dp(4), dp(4))
+            setPadding(dp(3), dp(3), dp(3), dp(3))
         }
+        val sensButtonWidth = if (compact) dp(30) else dp(34)
+        val sensValueWidth = if (compact) dp(36) else dp(43)
         sensBox.addView(actionButton("−", false).apply {
             textSize = 18f
+            contentDescription = "Decrease sensitivity"
             setOnClickListener { changeSensitivity(-0.1f) }
-        }, LinearLayout.LayoutParams(dp(34), dp(36)))
-        sensitivityText = label("1.1×", 13f, textMain, true).apply {
-            gravity = Gravity.CENTER
-        }
-        sensBox.addView(sensitivityText, LinearLayout.LayoutParams(dp(43), -2))
+        }, LinearLayout.LayoutParams(sensButtonWidth, if (compact) dp(34) else dp(36)))
+        sensitivityText = label("1.1×", 13f, textMain, true).apply { gravity = Gravity.CENTER }
+        sensBox.addView(sensitivityText, LinearLayout.LayoutParams(sensValueWidth, -2))
         sensBox.addView(actionButton("+", false).apply {
             textSize = 18f
+            contentDescription = "Increase sensitivity"
             setOnClickListener { changeSensitivity(0.1f) }
-        }, LinearLayout.LayoutParams(dp(34), dp(36)))
+        }, LinearLayout.LayoutParams(sensButtonWidth, if (compact) dp(34) else dp(36)))
         topbar.addView(sensBox, LinearLayout.LayoutParams(-2, -2))
-        shell.addView(topbar, LinearLayout.LayoutParams(-1, dp(44)).apply { bottomMargin = dp(8) })
+        shell.addView(topbar, LinearLayout.LayoutParams(-1, if (compact) dp(42) else dp(44)).apply { bottomMargin = dp(8) })
 
         val mainRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
+            gravity = Gravity.FILL
+            clipChildren = true
         }
         val touchSurface = TouchSurface(this).apply {
+            isClickable = true
             onMove = { dx, dy -> sendMove(dx, dy) }
             onTap = { sendClick(false) }
             onSecondTap = { sendClick(true) }
@@ -177,37 +203,43 @@ class MainActivity : Activity() {
 
         val scrollCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
+            gravity = Gravity.FILL
         }
         scrollCol.addView(actionButton("▲", false).apply {
             textSize = 17f
+            contentDescription = "Scroll up"
             setOnClickListener { sendScroll(1f) }
-        }, LinearLayout.LayoutParams(dp(52), dp(42)).apply { bottomMargin = dp(6) })
-        val scrollTrack = ScrollSurface(this) { delta -> sendScroll(delta) }
-        scrollCol.addView(scrollTrack, LinearLayout.LayoutParams(dp(52), 0, 1f).apply { bottomMargin = dp(6) })
+        }, LinearLayout.LayoutParams(railWidth, dp(42)).apply { bottomMargin = dp(6) })
+        val scrollTrack = ScrollSurface(this) { delta -> sendScroll(delta) }.apply { isClickable = true }
+        scrollCol.addView(scrollTrack, LinearLayout.LayoutParams(railWidth, 0, 1f).apply { bottomMargin = dp(6) })
         scrollCol.addView(actionButton("▼", false).apply {
             textSize = 17f
+            contentDescription = "Scroll down"
             setOnClickListener { sendScroll(-1f) }
-        }, LinearLayout.LayoutParams(dp(52), dp(42)))
-        mainRow.addView(scrollCol, LinearLayout.LayoutParams(dp(52), -1))
+        }, LinearLayout.LayoutParams(railWidth, dp(42)))
+        mainRow.addView(scrollCol, LinearLayout.LayoutParams(railWidth, -1))
         shell.addView(mainRow, LinearLayout.LayoutParams(-1, 0, 1f).apply { bottomMargin = dp(8) })
 
-        val bottomRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val bottomRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         bottomRow.addView(actionButton("Left", false).apply {
             textSize = 16f
+            contentDescription = "Left mouse click"
             setOnClickListener { sendClick(false) }
-        }, LinearLayout.LayoutParams(0, dp(54), 1f).apply { rightMargin = dp(8) })
+        }, LinearLayout.LayoutParams(0, bottomButtonHeight, 1f).apply { rightMargin = dp(8) })
         bottomRow.addView(actionButton("Right", false).apply {
             textSize = 16f
+            contentDescription = "Right mouse click"
             setOnClickListener { sendClick(true) }
-        }, LinearLayout.LayoutParams(0, dp(54), 1f))
+        }, LinearLayout.LayoutParams(0, bottomButtonHeight, 1f))
         shell.addView(bottomRow, LinearLayout.LayoutParams(-1, -2))
 
-        // Focusable but visually hidden: the keyboard button opens the system IME.
-        statusText = label("OFFLINE", 1f, textMuted, false)
-        statusText.visibility = View.GONE
+        // Keep the editor focusable for the IME without changing the visible layout.
+        statusText = label("OFFLINE", 1f, textMuted, false).apply { visibility = View.GONE }
         keyboardInput = EditText(this).apply {
-            alpha = 0f
+            alpha = 0.01f
             setSingleLine(true)
             textSize = 1f
             setTextColor(Color.TRANSPARENT)
@@ -218,12 +250,39 @@ class MainActivity : Activity() {
             isFocusableInTouchMode = true
             background = null
         }
-        shell.addView(keyboardInput, LinearLayout.LayoutParams(dp(1), dp(1)))
+        shell.addView(keyboardInput, LinearLayout.LayoutParams(dp(2), dp(2)))
         shell.isFocusableInTouchMode = true
         shell.requestFocus()
-        setContentView(shell)
+
+        setContentView(shell, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        applySystemBarInsets(shell, basePadding)
         installKeyboardForwarding()
         switchMode(Mode.WIFI)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun applySystemBarInsets(root: View, basePadding: Int) {
+        root.setOnApplyWindowInsetsListener { view, insets ->
+            val left: Int
+            val top: Int
+            val right: Int
+            val bottom: Int
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                left = bars.left
+                top = bars.top
+                right = bars.right
+                bottom = bars.bottom
+            } else {
+                left = insets.systemWindowInsetLeft
+                top = insets.systemWindowInsetTop
+                right = insets.systemWindowInsetRight
+                bottom = insets.systemWindowInsetBottom
+            }
+            view.setPadding(basePadding + left, basePadding + top, basePadding + right, basePadding + bottom)
+            insets
+        }
+        root.requestApplyInsets()
     }
 
     private fun openPhoneKeyboard() {
@@ -277,6 +336,7 @@ class MainActivity : Activity() {
 
         if (next == Mode.WIFI) {
             wifiAutoReconnect = true
+            if (!hasWifiDiscoveryPermission()) return
             if (socketOpen) setStatus("CONNECTED · WI-FI", true)
             else discoverWifiServer(showFailureToast = true)
         } else {
@@ -301,6 +361,17 @@ class MainActivity : Activity() {
      * mouse.py answers this UDP broadcast on discoveryPort and supplies its
      * automatically selected HTTP/WebSocket port.
      */
+    private fun hasWifiDiscoveryPermission(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES), 704)
+            setStatus("NEARBY DEVICES PERMISSION REQUIRED", false)
+            return false
+        }
+        return true
+    }
+
     private fun discoverWifiServer(showFailureToast: Boolean) {
         if (wifiDiscoveryRunning || mode != Mode.WIFI || !wifiAutoReconnect) return
         wifiDiscoveryRunning = true
@@ -308,33 +379,75 @@ class MainActivity : Activity() {
         Thread({
             var foundAuthority: String? = null
             try {
-                DatagramSocket().use { udp ->
+                val destinations = linkedSetOf<InetAddress>()
+                destinations.add(InetAddress.getByName("255.255.255.255"))
+                try {
+                    val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                    @Suppress("DEPRECATION")
+                    val dhcp = wifi.dhcpInfo
+                    if (dhcp != null && dhcp.ipAddress != 0 && dhcp.netmask != 0) {
+                        // WifiManager DHCP addresses are exposed in little-endian integer form.
+                        val broadcast = (dhcp.ipAddress and dhcp.netmask) or dhcp.netmask.inv()
+                        val bytes = byteArrayOf(
+                            (broadcast and 0xff).toByte(),
+                            ((broadcast ushr 8) and 0xff).toByte(),
+                            ((broadcast ushr 16) and 0xff).toByte(),
+                            ((broadcast ushr 24) and 0xff).toByte()
+                        )
+                        destinations.add(InetAddress.getByAddress(bytes))
+                    }
+                } catch (_: Exception) {
+                    // Global broadcast remains as a fallback on devices without DHCP info.
+                }
+
+                DatagramSocket(null).use { udp ->
+                    udp.reuseAddress = true
                     udp.broadcast = true
-                    udp.soTimeout = 650
-                    val destination = InetAddress.getByName("255.255.255.255")
+                    udp.bind(InetSocketAddress(0))
+                    udp.soTimeout = 700
+
+                    // Bind discovery traffic to Wi-Fi when Android has more than one active network.
+                    try {
+                        val connectivity = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+                        val wifiNetwork = connectivity.allNetworks.firstOrNull { network ->
+                            connectivity.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                        }
+                        wifiNetwork?.bindSocket(udp)
+                    } catch (_: Exception) {
+                        // The platform default network is used if explicit Wi-Fi binding is unavailable.
+                    }
+
                     val requestBytes = "REMOTE_MOUSE_DISCOVER".toByteArray(Charsets.UTF_8)
                     for (attempt in 0 until 5) {
-                        udp.send(DatagramPacket(requestBytes, requestBytes.size, destination, discoveryPort))
-                        val bytes = ByteArray(1024)
-                        val response = DatagramPacket(bytes, bytes.size)
-                        try {
-                            udp.receive(response)
-                            val payload = String(response.data, 0, response.length, Charsets.UTF_8)
-                            val json = JSONObject(payload)
-                            val port = json.optInt("port", -1)
-                            val service = json.optString("service")
-                            val host = response.address.hostAddress
-                            if (service == "remote-mouse" && port in 1..65535 && !host.isNullOrBlank()) {
-                                foundAuthority = "$host:$port"
-                                break
-                            }
-                        } catch (_: SocketTimeoutException) {
-                            // Try the next discovery broadcast.
+                        for (destination in destinations) {
+                            udp.send(DatagramPacket(requestBytes, requestBytes.size, destination, discoveryPort))
                         }
+                        val deadline = System.currentTimeMillis() + 700L
+                        while (System.currentTimeMillis() < deadline) {
+                            val bytes = ByteArray(1024)
+                            val response = DatagramPacket(bytes, bytes.size)
+                            try {
+                                udp.receive(response)
+                                val payload = String(response.data, 0, response.length, Charsets.UTF_8)
+                                val json = JSONObject(payload)
+                                val port = json.optInt("port", -1)
+                                val service = json.optString("service")
+                                val host = response.address.hostAddress
+                                if (service == "remote-mouse" && port in 1..65535 && !host.isNullOrBlank()) {
+                                    foundAuthority = "$host:$port"
+                                    break
+                                }
+                            } catch (_: SocketTimeoutException) {
+                                break
+                            } catch (_: Exception) {
+                                // Ignore unrelated or malformed UDP replies and keep listening.
+                            }
+                        }
+                        if (foundAuthority != null) break
                     }
                 }
             } catch (_: Exception) {
-                // No active Wi-Fi route, discovery blocked, or laptop not running.
+                // Discovery is retried below; a blocked broadcast must not crash the UI.
             }
 
             runOnUiThread {
@@ -345,7 +458,7 @@ class MainActivity : Activity() {
                     openWifiSocket(foundAuthority!!, showFailureToast)
                 } else {
                     setStatus("LAPTOP SERVER NOT FOUND", false)
-                    if (showFailureToast) toast("Start mouse.py on the laptop and allow it through the Windows private-network firewall.")
+                    if (showFailureToast) toast("No laptop found. Start mouse.py, use the same Wi-Fi, and allow Python through Windows Firewall on Private networks.")
                     scheduleWifiReconnect()
                 }
             }
@@ -492,6 +605,15 @@ class MainActivity : Activity() {
                 startBluetoothHid()
                 if (mode == Mode.BLUETOOTH) makeDiscoverable()
             } else toast("Bluetooth permissions are needed for HID pairing")
+        } else if (requestCode == 704) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES) == PackageManager.PERMISSION_GRANTED
+            ) {
+                if (mode == Mode.WIFI && wifiAutoReconnect) discoverWifiServer(showFailureToast = true)
+            } else {
+                setStatus("WI-FI DISCOVERY PERMISSION DENIED", false)
+                toast("Allow Nearby devices permission to find your laptop on Wi-Fi.")
+            }
         }
     }
 
@@ -507,7 +629,18 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun hasActiveConnection(): Boolean = if (mode == Mode.WIFI) socketOpen else bluetoothOpen
+
+    private fun showDisconnectedHint() {
+        val now = System.currentTimeMillis()
+        if (now - lastConnectionHintAt < 2200L) return
+        lastConnectionHintAt = now
+        val message = statusText.text?.toString()?.takeIf { it.isNotBlank() } ?: "Not connected"
+        toast(message)
+    }
+
     private fun sendMove(dx: Float, dy: Float) {
+        if (!hasActiveConnection()) return
         if (mode == Mode.WIFI) {
             sendWifi(JSONObject().put("type", "move").put("dx", dx.toDouble()).put("dy", dy.toDouble()))
         } else {
@@ -516,29 +649,40 @@ class MainActivity : Activity() {
     }
 
     private fun sendClick(right: Boolean) {
+        if (!hasActiveConnection()) { showDisconnectedHint(); return }
         if (mode == Mode.WIFI) {
             sendWifi(JSONObject().put("type", "click").put("button", if (right) "right" else "left"))
         } else bluetooth.click(right)
     }
 
     private fun sendScroll(dy: Float) {
+        if (!hasActiveConnection()) { showDisconnectedHint(); return }
         if (mode == Mode.WIFI) sendWifi(JSONObject().put("type", "scroll").put("dy", dy.toDouble()))
         else bluetooth.scroll(dy)
     }
 
     private fun sendText(value: String) {
         if (value.isEmpty()) return
+        if (!hasActiveConnection()) { showDisconnectedHint(); return }
         if (mode == Mode.WIFI) sendWifi(JSONObject().put("type", "text").put("text", value))
         else bluetooth.typeText(value)
     }
 
     private fun sendKey(key: String) {
+        if (!hasActiveConnection()) { showDisconnectedHint(); return }
         if (mode == Mode.WIFI) sendWifi(JSONObject().put("type", "key").put("key", key))
         else bluetooth.key(key)
     }
 
     private fun sendWifi(message: JSONObject) {
-        if (socketOpen) socket?.send(message.toString())
+        val activeSocket = socket
+        if (socketOpen && activeSocket != null) {
+            if (!activeSocket.send(message.toString())) {
+                socketOpen = false
+                if (mode == Mode.WIFI) setStatus("CONNECTION LOST · RETRYING", false)
+                scheduleWifiReconnect()
+            }
+        }
     }
 
     private fun changeSensitivity(delta: Float) {
@@ -552,6 +696,7 @@ class MainActivity : Activity() {
         statusText.text = message
         statusText.setTextColor(if (connected) accent else textMuted)
         statusDot.background = rounded(if (connected) accent else Color.rgb(238, 91, 91), 100f)
+        statusDot.contentDescription = message
     }
 
     private fun styleModeButton(button: Button, selected: Boolean) {
@@ -578,7 +723,9 @@ class MainActivity : Activity() {
         minWidth = 0
         minimumWidth = 0
         stateListAnimator = null
-        setPadding(dp(8), 0, dp(8), 0)
+        isClickable = true
+        isFocusable = true
+        setPadding(dp(6), 0, dp(6), 0)
     }
 
     private fun rounded(color: Int, radiusDp: Float, stroke: Int? = null): GradientDrawable = GradientDrawable().apply {
@@ -672,7 +819,11 @@ class MainActivity : Activity() {
                     performClick()
                     return true
                 }
-                MotionEvent.ACTION_CANCEL -> { pointer = -1; return true }
+                MotionEvent.ACTION_CANCEL -> {
+                    pointer = -1
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                    return true
+                }
             }
             return true
         }
@@ -708,7 +859,11 @@ class MainActivity : Activity() {
                     if (abs(delta) > 0.1f) onScroll(-delta / (18f * resources.displayMetrics.density))
                     return true
                 }
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { parent?.requestDisallowInterceptTouchEvent(false); performClick(); return true }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    parent?.requestDisallowInterceptTouchEvent(false)
+                    performClick()
+                    return true
+                }
             }
             return true
         }

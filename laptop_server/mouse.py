@@ -806,10 +806,17 @@ async def run_server():
         udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        udp_socket.bind((HOST, DISCOVERY_PORT))
-        discovery_transport, _ = await loop.create_datagram_endpoint(
-            lambda: DiscoveryProtocol(chosen_port), sock=udp_socket
-        )
+        try:
+            udp_socket.bind((HOST, DISCOVERY_PORT))
+            discovery_transport, _ = await loop.create_datagram_endpoint(
+                lambda: DiscoveryProtocol(chosen_port), sock=udp_socket
+            )
+        except OSError as exc:
+            udp_socket.close()
+            raise RuntimeError(
+                f"Could not open UDP discovery port {DISCOVERY_PORT}. "
+                "Close the other Remote Mouse server instance or allow Python through Windows Firewall."
+            ) from exc
 
         ip = await get_local_ip()
         print("=== Remote Mouse Server ===")
